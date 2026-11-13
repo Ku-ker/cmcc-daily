@@ -16,6 +16,7 @@ test-results/
 dist/
 .pytest_cache/
 .DS_Store
+.idea/
 # 本地备份与凭证残留
 *.bak
 *.bak-*
