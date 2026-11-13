@@ -219,6 +219,17 @@ function renderAccounts() {
     indicator.append(dot, document.createTextNode(summary.label));
     health.append(indicator, node("span", summary.checked_at ? `最近检查 ${dateText(summary.checked_at)}` : "首次执行后更新状态", "checked-at"));
     card.append(top, health);
+    const keep = account.keepalive;
+    if (keep?.enabled) {
+      const ka = node("span", undefined, `account-health ${keep.state === "failed" ? "invalid" : keep.state === "success" ? "normal" : "unknown"}`);
+      const kaDot = node("span", undefined, "status-dot"); kaDot.setAttribute("aria-hidden", "true");
+      const kaLabel = keep.state === "failed" ? "保活失败 · 请重新抓包" : keep.state === "success" ? "保活正常" : "等待首次保活";
+      ka.append(kaDot, document.createTextNode(`凭证保活 ${kaLabel}`));
+      ka.title = keep.detail || `每 ${keep.minutes} 分钟在后台刷新会话`;
+      const kaLine = node("div", undefined, "account-health-line keepalive-line");
+      kaLine.append(ka, node("span", keep.at ? `上次保活 ${dateText(keep.at)}` : `每 ${keep.minutes} 分钟`, "checked-at"));
+      card.append(kaLine);
+    }
     if (summary.state === "invalid") card.append(node("p", summary.issue_detail || "请更新凭证后重试", "account-issue invalid"));
     if (summary.issue && ["running", "queued"].includes(summary.state)) {
       card.append(node("p", summary.issue === "invalid" ? "上次凭证失效 · 本次结果返回后更新" : "上次任务异常 · 本次结果返回后更新", "account-issue"));
@@ -474,9 +485,12 @@ function openAccount(account = null) {
     for (const field of configFields) if (!secretFields.includes(field)) form.elements[field].value = account.config[field] || "";
     for (const field of secretFields) form.elements[field].placeholder = account[`has_${field}`] ? "已保存；留空保留，填写则更新" : "未设置";
     for (const [key, value] of Object.entries(account.options)) if (form.elements[key]) form.elements[key].checked = value;
+    form.elements.keepalive_enabled.checked = Boolean(account.keepalive?.enabled);
+    form.elements.keepalive_minutes.value = account.keepalive?.minutes || 15;
   } else {
     form.elements.app_token.placeholder = "粘贴 appTokenLogin 请求体中的 token";
     for (const field of secretFields.filter(f => f !== "app_token")) form.elements[field].placeholder = "选填";
+    form.elements.keepalive_minutes.value = 15;
   }
   buildScheduleRows(account);
   $("#account-dialog").showModal();
@@ -883,9 +897,10 @@ $("#account-form").addEventListener("submit", event => {
   submit(form, "#account-error", async () => {
     const config = Object.fromEntries(configFields.map(field => [field, form.elements[field].value]));
     const options = Object.fromEntries(["claim", "tasks", "games"].map(field => [field, form.elements[field].checked]));
+    const keepalive = {enabled: form.elements.keepalive_enabled.checked, minutes: Number(form.elements.keepalive_minutes.value)};
     const clear = ["serverchan_sendkey", "bark_url", "webhook_url", "webhook_token", "fee_session_cookie"].filter(field => form.elements[`clear_${field}`].checked);
     await api(state.editing ? `/accounts/${state.editing.id}` : "/accounts", state.editing ? "PUT" : "POST", {
-      name: form.elements.name.value, config, options, schedules: readSchedules(), clear_secrets: clear,
+      name: form.elements.name.value, config, options, keepalive, schedules: readSchedules(), clear_secrets: clear,
     });
     $("#account-dialog").close();
     const added = !state.editing;

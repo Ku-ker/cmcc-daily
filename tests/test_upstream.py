@@ -77,6 +77,87 @@ class UpstreamAdaptationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 cmcc_rate.run(SimpleNamespace(phone="13800001234"), True, None)
 
+    def test_json_obj_guard_blocks_degraded_responses(self):
+        for payload in ("系统繁忙", 42, ["系统繁忙"]):
+            r = Mock(status_code=503, text="系统繁忙", headers={"Content-Type": "text/html"})
+            r.json.return_value = payload
+            with self.assertRaises(RuntimeError) as ctx:
+                cmcc_sign.json_obj(r, "markstatus")
+            self.assertIn("markstatus", str(ctx.exception))
+            self.assertIn("非对象", str(ctx.exception))
+        r = Mock(status_code=503, text="系统繁忙", headers={})
+        r.json.return_value = "系统繁忙"
+        with self.assertRaises(RuntimeError) as ctx:
+            cmcc_sign.json_obj(r, "markstatus")
+        self.assertIn("系统繁忙", str(ctx.exception), "报错要带原始响应片段")
+        r = Mock(status_code=502, text="<html>bad gateway</html>", headers={})
+        r.json.side_effect = ValueError("Expecting value")
+        with self.assertRaises(RuntimeError) as ctx:
+            cmcc_sign.json_obj(r, "domark")
+        self.assertIn("domark", str(ctx.exception))
+        self.assertIn("bad gateway", str(ctx.exception))
+        r = Mock(status_code=200)
+        r.json.return_value = {"code": "SUCCESS"}
+        self.assertEqual(cmcc_sign.json_obj(r, "markstatus"), {"code": "SUCCESS"})
+
+    def test_markstatus_bare_string_response_is_contextual(self):
+        session = Mock()
+        r = Mock(status_code=200, headers={})
+        r.json.return_value = "系统繁忙"
+        session.post.return_value = r
+        with self.assertRaises(RuntimeError) as ctx:
+            cmcc_sign.query_markstatus(session, "https://example.com")
+        self.assertIn("markstatus", str(ctx.exception))
+
+    def test_task_award_bare_string_response_is_contextual(self):
+        session = Mock()
+        r = Mock(status_code=200, headers={})
+        r.json.return_value = "系统繁忙"
+        session.post.return_value = r
+        with self.assertRaises(RuntimeError) as ctx:
+            cmcc_sign.claim_task_awards(session, "https://example.com", {"taskAwardChance": [{"id": "1001"}]})
+        self.assertIn("taskAward/1001", str(ctx.exception))
+
+    def exchange_session_with_replies(self, reply, seed_jwt=None):
+        posts = []
+
+        def post(url, json=None, timeout=None):
+            posts.append(json)
+            return reply(json)
+
+        session = Mock()
+        session.get.return_value.text = "loginPath = '/appTokenLogin?sid=preview'"
+        session.cookies.keys.return_value = ["QWHD_SESSION_TOKEN"]
+        session.post.side_effect = post
+        cfg = SimpleNamespace(phone="13800000011", app_token="preview-token", act_url="https://example.com",
+                              province_code="731", city_code="0731", carrier_operator="002", app_version_code="12.5.2")
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"CMCC_DATA_DIR": root}), \
+                patch.object(cmcc_sign.requests, "Session", return_value=session), \
+                patch.object(cmcc_sign, "assert_safe_url"):
+            if seed_jwt:
+                cmcc_sign.save_jwt_cache(SimpleNamespace(phone="13800000011"), seed_jwt)
+            cmcc_sign.exchange_session(cfg)
+        return posts
+
+    def test_renewal_sends_jwt_plus_app_token_before_jwt_only(self):
+        def reply(payload):
+            if payload["token"] == "":
+                return Mock(json=Mock(return_value={"code": "SUCCESS", "data": {"jwt": "preview-jwt2", "url": "https://example.com"}}))
+            return Mock(json=Mock(return_value={"code": "FAILED", "msg": "校验失败"}))
+
+        posts = self.exchange_session_with_replies(reply, seed_jwt="preview-jwt")
+        self.assertEqual([p["token"] for p in posts], ["preview-token", ""], "先带 app_token 续期，被拒后 jwt 单独重试")
+        self.assertEqual([p["jwtToken"] for p in posts], ["preview-jwt", "preview-jwt"])
+
+    def test_bootstrap_uses_app_token_when_no_cached_jwt(self):
+        def reply(payload):
+            self.assertIsNone(payload["jwtToken"])
+            return Mock(json=Mock(return_value={"code": "SUCCESS", "data": {"jwt": "preview-jwt3", "url": "https://example.com"}}))
+
+        posts = self.exchange_session_with_replies(reply)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["token"], "preview-token")
+
 
 if __name__ == "__main__":
     unittest.main()

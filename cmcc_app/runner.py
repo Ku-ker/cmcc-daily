@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .storage import atomic_json
@@ -12,6 +13,7 @@ from .models import utcnow
 
 log = logging.getLogger(__name__)
 MAX_LOG_BYTES = 2 * 1024 * 1024
+KEEPALIVE_SCAN_INTERVAL = 30  # 调度循环每秒一跳，每 30 秒扫一次到期保活
 
 
 class Manager(threading.Thread):
@@ -23,6 +25,8 @@ class Manager(threading.Thread):
         self.cancelled = set()
         self.cancel_lock = threading.Lock()
         self.parallel_running = set()
+        self.keepalive_running = set()
+        self.ticks = 0
         self.data = settings.data_dir
         for folder in ("logs", "runtime", "cache"):
             (self.data / folder).mkdir(parents=True, exist_ok=True)
@@ -55,6 +59,9 @@ class Manager(threading.Thread):
                 self.store.schedule_due(self.settings.timezone)
                 for job in self.store.schedule_activities_due(self.settings.timezone):
                     log.info("活动 %s 的秒杀任务已排队", job["account_id"])
+                self.ticks += 1
+                if self.ticks % KEEPALIVE_SCAN_INTERVAL == 0:
+                    self.run_keepalives_due()
                 if self.heartbeat - last_prune > 3600:
                     self.store.prune(self.settings.retention_days)
                     last_prune = self.heartbeat
@@ -72,6 +79,58 @@ class Manager(threading.Thread):
         with self.store.connect() as conn:
             row = conn.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
         return row is None or row[0] not in ("queued", "running")
+
+    def run_keepalives_due(self):
+        """对开启了保活且到期的账号各起一个后台线程；同一账号同时只有一个保活在跑。"""
+        now = utcnow()
+        for account in self.store.keepalive_accounts():
+            if account["id"] in self.keepalive_running:
+                continue
+            entry = account["keepalive"]
+            last = entry.get("at")
+            try:
+                due = (not last or datetime.fromisoformat(last)
+                       + timedelta(minutes=entry["minutes"]) <= now)
+            except ValueError:
+                due = True
+            if not due:
+                continue
+            config_path = self.data / "runtime" / f"keepalive-{account['id']}.json"
+            atomic_json(config_path, account["config"])
+            self.keepalive_running.add(account["id"])
+            thread = threading.Thread(target=self._keepalive_body,
+                                      args=(account, config_path),
+                                      name=f"keepalive-{account['id'][:8]}", daemon=True)
+            thread.start()
+
+    def _keepalive_body(self, account, config_path):
+        """同步执行一次保活并回写状态；从 failed 恢复或首次失败时推送通知。"""
+        try:
+            import cmcc_keepalive
+            import cmcc_sign
+            cfg = cmcc_sign.Config(str(config_path))
+            at = utcnow().isoformat()
+            try:
+                ok, detail = cmcc_keepalive.keepalive(cfg)
+            except Exception as exc:
+                ok, detail = False, f"{type(exc).__name__}: {exc}"
+            state = "success" if ok else "failed"
+            self.store.set_keepalive_result(account["id"], state, at, detail)
+            if not ok and account["keepalive"].get("state") != "failed":
+                log.warning("账号 %s 凭证保活失败：%s", account["name"], detail)
+                try:
+                    cmcc_sign.notify(cfg, "中国移动凭证保活失败",
+                                     f"凭证保活失败：{detail}\n"
+                                     "通常需要重新抓包更新该账号的 App Token")
+                except Exception as exc:
+                    log.warning("保活失败通知推送异常：%s", type(exc).__name__)
+            elif ok:
+                log.info("账号 %s 凭证保活成功（%s）", account["name"], detail)
+        except Exception:
+            log.exception("账号 %s 保活线程异常", account.get("name"))
+        finally:
+            config_path.unlink(missing_ok=True)
+            self.keepalive_running.discard(account["id"])
 
     def execute(self, run, parallel=False):
         if parallel:

@@ -252,6 +252,31 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("--wed", args)
         self.assertIn("--no-claim", args)
 
+    def test_keepalive_defaults_and_validation(self):
+        account = normalize_account(account_data())
+        self.assertEqual(account["keepalive"], {"enabled": False, "minutes": 15})
+        updated = normalize_account({**account_data(), "keepalive": {"enabled": True, "minutes": 30}}, account)
+        self.assertEqual(updated["keepalive"], {"enabled": True, "minutes": 30})
+        # 只提交开关时沿用已保存的间隔
+        toggled = normalize_account({"keepalive": {"enabled": True}}, updated)
+        self.assertEqual(toggled["keepalive"], {"enabled": True, "minutes": 30})
+        for bad in ({"minutes": 4}, {"minutes": 721}, {"minutes": "15"}, {"minutes": True},
+                    {"enabled": "yes"}, {"unknown": 1}, []):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                normalize_account({**account_data(), "keepalive": bad})
+
+    def test_keepalive_state_survives_account_edit(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(Path(root))
+            account = normalize_account(account_data())
+            store.save(account)
+            store.set_keepalive_result(account["id"], "failed", "2026-10-21T02:00:00+00:00", "三档凭证全部被拒")
+            store.save(normalize_account({"keepalive": {"enabled": True, "minutes": 30}}, store.account(account["id"])))
+            saved = store.account(account["id"])["keepalive"]
+            self.assertEqual(saved, {"enabled": True, "minutes": 30, "state": "failed",
+                                     "at": "2026-10-21T02:00:00+00:00", "detail": "三档凭证全部被拒"})
+            self.assertEqual([a["id"] for a in store.keepalive_accounts()], [account["id"]])
+
     def test_timezone_and_midnight(self):
         now = datetime(2026, 10, 12, 15, 59, tzinfo=timezone.utc)
         self.assertEqual(next_run("00:01", "Asia/Shanghai", now), "2026-10-12T16:01:00+00:00")

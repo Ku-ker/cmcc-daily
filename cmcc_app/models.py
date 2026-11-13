@@ -16,6 +16,8 @@ CONFIG_DEFAULTS = {
 }
 OPTION_DEFAULTS = {"claim": True, "tasks": False, "games": False, "wed": False}
 TASKS = {"sign": "每日签到", "wed": "周三拼图", "rate": "评价有礼", "fee": "话费查询", "seckill": "假期秒杀"}
+KEEPALIVE_DEFAULTS = {"enabled": False, "minutes": 15}
+KEEPALIVE_MIN_MINUTES, KEEPALIVE_MAX_MINUTES = 5, 720
 
 
 def utcnow():
@@ -204,9 +206,23 @@ def normalize_account(body, old=None, timezone_name="Asia/Shanghai"):
         raise ValueError("任务选项必须为布尔值")
     # 周三拼图已是独立任务，签到脚本不再顺带执行，避免同一天跑两次。
     options["wed"] = False
+    supplied_keepalive = body.get("keepalive", {})
+    if not isinstance(supplied_keepalive, dict) or set(supplied_keepalive) - {"enabled", "minutes"}:
+        raise ValueError("凭证保活配置格式不正确")
+    old_keepalive = old.get("keepalive") if isinstance(old.get("keepalive"), dict) else {}
+    enabled = supplied_keepalive.get("enabled", old_keepalive.get("enabled", False))
+    if not isinstance(enabled, bool):
+        raise ValueError("凭证保活开关必须为布尔值")
+    keepalive = {
+        "enabled": enabled,
+        "minutes": supplied_keepalive.get("minutes", old_keepalive.get("minutes", KEEPALIVE_DEFAULTS["minutes"])),
+    }
+    if isinstance(keepalive["minutes"], bool) or not isinstance(keepalive["minutes"], int) \
+            or not KEEPALIVE_MIN_MINUTES <= keepalive["minutes"] <= KEEPALIVE_MAX_MINUTES:
+        raise ValueError(f"保活间隔应为 {KEEPALIVE_MIN_MINUTES}～{KEEPALIVE_MAX_MINUTES} 分钟")
     schedules = normalize_schedules(body, old, timezone_name)
     account = {"id": old.get("id", uuid.uuid4().hex), "name": name.strip(),
-               "config": config, "options": options, "schedules": schedules}
+               "config": config, "options": options, "keepalive": keepalive, "schedules": schedules}
     account.update(schedule_mirrors(schedules))
     return account
 
@@ -392,6 +408,14 @@ class Store:
             # 1.6.7 起秒杀记录记住自己来自哪个活动，执行时据此取活动的抢购参数。
             if "activity_id" not in run_columns:
                 conn.execute("ALTER TABLE runs ADD COLUMN activity_id TEXT")
+            # 1.7.0 起账号可开启后台凭证保活：开关与间隔由网页编辑，状态由调度器回写。
+            for column, ddl in (("keepalive_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                                ("keepalive_minutes", "INTEGER NOT NULL DEFAULT 15"),
+                                ("keepalive_state", "TEXT NOT NULL DEFAULT ''"),
+                                ("keepalive_at", "TEXT NOT NULL DEFAULT ''"),
+                                ("keepalive_detail", "TEXT NOT NULL DEFAULT ''")):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {ddl}")
             conn.execute("CREATE INDEX IF NOT EXISTS runs_account_task ON runs(account_id,task,dry_run,created_at DESC)")
             # 有明确主签到成功证据的旧记录按新规则更新；保留子结果、日志和退出码。
             for row in conn.execute("SELECT * FROM runs WHERE task='sign' AND dry_run=0 "
@@ -437,6 +461,13 @@ class Store:
         value["options"] = {**OPTION_DEFAULTS, **json.loads(value["options"])}
         # 旧账号可能勾选过「签到时一并执行周三拼图」，读取时按独立任务处理。
         value["options"]["wed"] = False
+        value["keepalive"] = {
+            "enabled": bool(value.pop("keepalive_enabled", 0)),
+            "minutes": value.pop("keepalive_minutes", KEEPALIVE_DEFAULTS["minutes"]),
+            "state": value.pop("keepalive_state", "") or "",
+            "at": value.pop("keepalive_at", "") or "",
+            "detail": value.pop("keepalive_detail", "") or "",
+        }
         value["schedules"] = decode_schedules(value.pop("schedules", None), raw)
         # enabled/schedule_time/next_run 是旧版字段，始终按任务计划重新计算。
         value.update(schedule_mirrors(value["schedules"]))
@@ -472,19 +503,23 @@ class Store:
                         entry["next_run"] = old.get("next_run")
             account["schedules"] = schedules
             account.update(schedule_mirrors(schedules))
+            keepalive = account.get("keepalive") or KEEPALIVE_DEFAULTS
             try:
                 conn.execute("""INSERT INTO accounts
-                    (id,name,phone,config,options,enabled,schedule_time,next_run,schedules,status_reset_at,fee_reset_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    (id,name,phone,config,options,enabled,schedule_time,next_run,schedules,
+                     status_reset_at,fee_reset_at,keepalive_enabled,keepalive_minutes)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(id) DO UPDATE SET name=excluded.name, phone=excluded.phone,
                     config=excluded.config, options=excluded.options, enabled=excluded.enabled,
                     schedule_time=excluded.schedule_time, next_run=excluded.next_run,
-                    schedules=excluded.schedules""",
+                    schedules=excluded.schedules, keepalive_enabled=?, keepalive_minutes=?""",
                     (account["id"], account["name"], account["config"]["phone"],
                      json.dumps(account["config"]), json.dumps(account["options"]),
                      account["enabled"], account["schedule_time"], account["next_run"],
                      json.dumps(schedules, ensure_ascii=False),
-                     account.get("status_reset_at", ""), account.get("fee_reset_at", "")))
+                     account.get("status_reset_at", ""), account.get("fee_reset_at", ""),
+                     int(bool(keepalive.get("enabled"))), keepalive.get("minutes", KEEPALIVE_DEFAULTS["minutes"]),
+                     int(bool(keepalive.get("enabled"))), keepalive.get("minutes", KEEPALIVE_DEFAULTS["minutes"])))
             except sqlite3.IntegrityError:
                 raise ValueError("此手机号已经存在") from None
 
@@ -572,6 +607,16 @@ class Store:
                                     WHERE id=?""",
                                  (json.dumps(schedules, ensure_ascii=False), mirrors["enabled"],
                                   mirrors["schedule_time"], mirrors["next_run"], account["id"]))
+
+    def keepalive_accounts(self):
+        """开启了凭证保活的账号清单，供调度器按各自间隔轮询。"""
+        return [account for account in self.accounts() if account["keepalive"]["enabled"]]
+
+    def set_keepalive_result(self, account_id, state, at, detail):
+        """回写一次后台保活的结果；状态只在账号卡片展示，不进执行记录。"""
+        with self.connect() as conn:
+            conn.execute("UPDATE accounts SET keepalive_state=?, keepalive_at=?, keepalive_detail=? "
+                         "WHERE id=?", (state, at, detail, account_id))
 
     def take_run_parallel(self):
         """取一个待执行的秒杀任务（不同账号可同时开抢）。"""

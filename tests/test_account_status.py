@@ -265,13 +265,17 @@ class StructuredResultTests(unittest.TestCase):
             return cmcc_sign.exchange_session(cfg)
 
     def test_jwt_fallback_recovery_stays_green(self):
+        # 三档续期：jwt+app_token 与 jwt 单独两档都被拒后，app_token 引导兜底成功
         self.exchange([{"code": "EXPIRED", "msg": "jwt过期"},
+                       {"code": "EXPIRED", "msg": "jwt过期"},
                        {"code": "SUCCESS", "data": {"jwt": "preview-renewed", "url": "https://example.com"}}])
         self.assertEqual(results.finish(0)["auth"], "valid")
 
     def test_final_expired_token_is_red_and_network_error_is_not(self):
         with self.assertRaises(RuntimeError):
-            self.exchange([{"code": "EXPIRED", "msg": "jwt过期"}, {"code": "EXPIRED", "msg": "token失效"}])
+            self.exchange([{"code": "EXPIRED", "msg": "jwt过期"},
+                           {"code": "EXPIRED", "msg": "jwt过期"},
+                           {"code": "EXPIRED", "msg": "token失效"}])
         results.error(RuntimeError("private"))
         self.assertEqual(results.finish(1)["reason"], "auth")
         results.start("sign", {})

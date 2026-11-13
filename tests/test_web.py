@@ -59,6 +59,34 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("very-private-token", response.get_data(as_text=True))
         self.assertTrue(response.json["accounts"][0]["has_app_token"])
 
+    def test_keepalive_settings_round_trip_and_validation(self):
+        account = self.add_account()
+        path = f"/api/accounts/{account['id']}"
+        response = self.client.put(path, headers=self.headers,
+                                   json={"keepalive": {"enabled": True, "minutes": 30}})
+        self.assertEqual(response.status_code, 200)
+        saved = self.store.account(account["id"])["keepalive"]
+        self.assertEqual(saved["enabled"], True)
+        self.assertEqual(saved["minutes"], 30)
+        public = self.client.get("/api/accounts").json["accounts"][0]
+        self.assertEqual(public["keepalive"], {"enabled": True, "minutes": 30, "state": "", "at": "", "detail": ""})
+        for bad in ({"minutes": 3}, {"minutes": 721}, {"minutes": "15"}, {"enabled": "yes"}, {"unknown": 1}):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.client.put(path, headers=self.headers,
+                                                 json={"keepalive": bad}).status_code, 400)
+        # 非法提交不落库
+        self.assertEqual(self.store.account(account["id"])["keepalive"]["minutes"], 30)
+
+    def test_keepalive_survives_account_creation_insert(self):
+        response = self.client.post("/api/accounts", headers=self.headers, json={
+            "name": "新建即保活", "config": {"phone": "13800001234", "app_token": "very-private-token"},
+            "enabled": False, "keepalive": {"enabled": True, "minutes": 5},
+        })
+        self.assertEqual(response.status_code, 201)
+        saved = self.store.account(response.json["account"]["id"])["keepalive"]
+        self.assertEqual(saved["enabled"], True, "首次 INSERT 也要带上 keepalive 列")
+        self.assertEqual(saved["minutes"], 5)
+
     def test_webhook_settings_persist_preserve_and_clear_without_leaking(self):
         account = self.add_account()
         path = f"/api/accounts/{account['id']}"

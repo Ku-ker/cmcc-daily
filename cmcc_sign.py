@@ -236,11 +236,15 @@ def exchange_session(cfg: Config, act_url: str | None = None) -> tuple[requests.
 
     返回 (session, referer)。referer 是带 token 的活动页地址，后续 API 都要带。
 
-    凭证策略（实测结论）：
+    凭证策略（实测结论，2026-10-21 更新）：
     - jwt 是账号级长期凭证：appTokenLogin 请求里 jwtToken 优先于 token 字段，
-      服务端校验通过 jwt 即签发会话（使用 jwt 时 token 字段可留空），
-      且不受 App 内切换登录影响；
-    - 因此优先用缓存 jwt 免票据续期，app_token 仅在 jwt 缺失/失效时作引导兜底；
+      服务端校验通过 jwt 即签发会话，且不受 App 内切换登录影响；
+    - 2026-10-20 起服务端收紧了校验：只带 jwt（token 字段留空）的续期会被拒，
+      返回 FAILED / APP登录状态已过期（上游 issue #15），"免票据续期"走不通；
+      实测 jwt 与 app_token 一起发即可续期成功；
+    - 因此续期依次尝试两条路径：jwt+app_token → jwt 单独，
+      兼顾服务端恢复 jwt 单独续期、或 app_token 先于 jwt 失效的情况，
+      都失败再回落纯 app_token 引导；
     - 每次登录响应都会重签 jwt，总是回写缓存保持最新。
     """
     s = requests.Session()
@@ -266,27 +270,31 @@ def exchange_session(cfg: Config, act_url: str | None = None) -> tuple[requests.
         "took": random.randint(120, 900),
     }
 
-    # ② 优先用缓存 jwt 免票据续期
+    # ② 优先用缓存 jwt 续期：2026-10-20 起服务端不再接受"只带 jwt"（token 留空）的续期，
+    # 报 APP登录状态已过期（上游 issue #15），实测把 app_token 一起发即可续期成功，故优先这样试；
+    # 仍保留"只带 jwt"作为第二次尝试，以便服务端恢复该口子或 app_token 先失效时仍能续期。
     resp = None
     cached = load_jwt_cache(cfg)
     if cached:
         jwt_str, jwt_first_seen = cached
-        r = s.post(login_url, json={**base_body, "jwtToken": jwt_str, "token": ""}, timeout=30)
-        try:
-            cand = r.json()
-        except ValueError:
-            cand = {}
-        if cand.get("code") == "SUCCESS":
-            resp = cand
-            log.info("jwt 续期成功（未使用 app_token，凭证链已 %.1f 天）",
-                     (time.time() - jwt_first_seen) / 86400)
-        else:
-            log.info("jwt 续期失败(%s)，回落 appTokenLogin 引导", cand.get("msg"))
+        for label, tok in (("jwt+app_token", cfg.app_token or ""), ("jwt 单独", "")):
+            r = s.post(login_url, json={**base_body, "jwtToken": jwt_str, "token": tok}, timeout=30)
+            try:
+                cand = r.json()
+            except ValueError:
+                cand = {}
+            if isinstance(cand, dict) and cand.get("code") == "SUCCESS":
+                resp = cand
+                log.info("jwt 续期成功（%s，凭证链已 %.1f 天）",
+                         label, (time.time() - jwt_first_seen) / 86400)
+                break
+            log.info("jwt 续期失败[%s](%s)", label,
+                     cand.get("msg") if isinstance(cand, dict) else f"响应非对象 {type(cand).__name__}")
 
     # ③ 回落：app_token 引导登录（首次配置或 jwt 失效后）
     if resp is None:
         r = s.post(login_url, json={**base_body, "jwtToken": None, "token": cfg.app_token}, timeout=30)
-        resp = r.json()
+        resp = json_obj(r, "appTokenLogin")
         if resp.get("code") != "SUCCESS":
             message = str(resp.get("msg") or "").lower()
             if (any(word in message for word in ("token", "jwt", "凭证", "票据", "会话", "登录", "认证"))
@@ -300,7 +308,9 @@ def exchange_session(cfg: Config, act_url: str | None = None) -> tuple[requests.
                 "通常是 app_token 过期，请重新抓包更新凭证"
             )
 
-    data = resp["data"]
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"appTokenLogin 返回的 data 不是对象: {str(data)[:200]!r}")
     save_jwt_cache(cfg, data.get("jwt"))
 
     # ③ 访问带 token 的活动页，服务器 Set-Cookie: QWHD_SESSION_TOKEN
@@ -320,19 +330,43 @@ def exchange_session(cfg: Config, act_url: str | None = None) -> tuple[requests.
 
 # ---------------------------------------------------------------- 业务接口
 
+def json_obj(r, what: str) -> dict:
+    """把响应体解析成 dict，失败时抛带上下文的 RuntimeError。
+
+    上游在某些时刻会返回裸 JSON 字符串（如 "系统繁忙"）或非 JSON 文本而不是对象，
+    此时 r.json() 的结果是 str，后续 .get("code") 会炸出
+    'str' object has no attribute 'get'，报错看不出是哪个接口降级了。
+    这里统一拦截并带上原始 body 前 200 字符。
+    """
+    try:
+        data = r.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"{what} 返回非 JSON: HTTP {r.status_code} "
+            f"content-type={r.headers.get('Content-Type')} body={r.text[:200]!r}"
+        ) from e
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"{what} 返回非对象: HTTP {r.status_code} "
+            f"type={type(data).__name__} body={str(data)[:200]!r}"
+        )
+    return data
+
+
 def query_markstatus(s: requests.Session, referer: str) -> dict:
     r = s.post(f"{API_MARK}/mark31/markstatus", json={}, headers=api_headers(referer), timeout=30)
     r.raise_for_status()
-    resp = r.json()
+    resp = json_obj(r, "markstatus")
     if resp.get("code") != "SUCCESS":
         raise PermissionError(f"markstatus 失败: {resp.get('code')} {resp.get('msg')}")
-    return resp["data"]
+    data = resp.get("data")
+    return data if isinstance(data, dict) else {}
 
 
 def do_mark(s: requests.Session, referer: str, date: str) -> dict:
     r = s.post(f"{API_MARK}/mark31/domark", json={"date": date}, headers=api_headers(referer), timeout=30)
     r.raise_for_status()
-    return r.json()
+    return json_obj(r, "domark")
 
 
 def claim_task_awards(s: requests.Session, referer: str, status_data: dict) -> list[str]:
@@ -373,11 +407,12 @@ def claim_task_awards(s: requests.Session, referer: str, status_data: dict) -> l
         if not tid:
             continue
         r = s.post(f"{API_MARK}/mark31/taskAward/{tid}", json={}, headers=api_headers(referer), timeout=30)
-        resp = r.json()
-        data = resp.get("data") or {}
+        resp = json_obj(r, f"taskAward/{tid}")
+        data = resp.get("data")
+        data = data if isinstance(data, dict) else {}
         # status 为 None 时回落到 code（实测领奖成功响应 status 可能为空）；
         # 成功领取时 data 带 prizeName/prizeValue，直接展示领到了什么
-        if isinstance(data, dict) and data.get("prizeName"):
+        if data.get("prizeName"):
             value = data.get("prizeValue")
             unit = {"FLOW": "MB", "FEE": "元"}.get(data.get("prizeCategory"), "")
             amount = f"{value}{unit}" if value else ""

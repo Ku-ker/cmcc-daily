@@ -1,5 +1,15 @@
 # 验证记录
 
+## 1.7.0：上游 fix #16/#18 合入与应用内凭证保活（2026-11-13，未发布）
+
+改动来源：上游 yupaiLy/cmcc-auto-checkin 两个未合并 fix。#16：2026-10-20 起服务端拒绝「只带 jwt」的续期，`cmcc_sign.exchange_session` 改为三档（jwt+app_token → jwt 单独 → 纯 app_token 引导）。#18：上游偶发返回裸 JSON 字符串（如 `"系统繁忙"`）导致 `AttributeError`，新增 `json_obj()` 守卫应用到 appTokenLogin／markstatus／domark／taskAward 四处；另移植 `cmcc_keepalive.py`（独立保活脚本）与 `cmcc_app_token_probe.py`（app_token 存活探针）。本仓库增强：保活集成为应用内后台任务——账号表新增 5 列（启用/间隔/状态/时间/详情），编辑页开关 + 间隔分钟（5–720），Manager 每 30 秒扫描到期账号起守护线程执行；仅状态转为 failed 时推送一次通知，恢复后再次失败才重新推送；保活不写入执行记录；运行配置用完即删。探针仅作独立脚本，不接 UI。
+
+验证：Python 3.12 venv 下 `python -m unittest discover -s tests -q` 共 220 项通过（4 项 Linux 专用测试在 Windows 跳过）；`node --check cmcc_app/static/app.js` 通过。新增覆盖：`json_obj` 五种响应形态、三档续期 payload 顺序（jwt+app_token 失败后 jwt 单独、无缓存时直接 app_token 引导）、markstatus/taskAward 裸字符串不再抛 AttributeError、keepalive 归一化校验（minutes 越界/类型错误 400）、账号编辑保留保活状态列、新建账号 INSERT 路径带保活列、Web 往返与非法值不落库、保活脚本三档顺序与裸字符串换档、Manager 成功不推送/失败转 failed 推送一次/持续失败不重复/到期才执行/禁用与并发跳过/运行配置即删。
+
+本机冒烟（Windows，`CMCC_DATA_DIR=./tmp-data`，端口 8137，虚构手机号 13800000011 + 占位 token）：POST 新建账号直接带 `keepalive: {enabled: true, minutes: 5}`，GET 立即返回 enabled=true（该用例曾在开发中暴露 Store.save INSERT 路径漏写保活列的缺陷，已修复并补回归测试）；约 60 秒后后台扫描执行保活，状态落为 `failed`，详情带上游「APP登录状态已过期」与错误码（假 token 预期失败），服务日志输出「凭证保活失败」，`/api/runs` 保持为空（不产生执行记录），`data/runtime/` 运行配置已删除；PUT 关闭开关后 enabled=false 且 minutes 保留。独立脚本 `python cmcc_keepalive.py --help`、`python cmcc_app_token_probe.py --help` 正常。
+
+未完成：本机未安装 Docker，`tests/container_smoke.py` 容器冒烟跳过，待发布前在有 Docker 的环境补跑；浏览器端账号卡片保活行的实际渲染未做无头浏览器检查（app.js 语法检查通过、服务页含保活控件、卡片渲染逻辑由 API 数据与既有回归覆盖）。镜像未构建、未发布，代码未提交，均待用户确认。
+
 ## 1.6.10：秒杀卡片移除与主签到判定（2026-10-15，已发布）
 
 仅秒杀提供「移除」：在服务端持久保存隐藏状态，历史、日志、计划不变；重新入队时恢复显示。前后端同时限制任务类型，结束前不允许隐藏，并校验提交的结果 ID，防止旧页面把新结果移除。卡片隐藏不会改变任务的真实执行结果或批量范围。
