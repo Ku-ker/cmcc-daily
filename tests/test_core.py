@@ -314,6 +314,14 @@ class ConfigTests(unittest.TestCase):
                          ["--config", "a.json"], "非法参数不能拼进命令行")
         self.assertEqual(task_args("sign", Path("a.json"), {"claim": True}, False, {"lead": 5}),
                          ["--config", "a.json"], "活动参数只作用于秒杀任务")
+        # 周三抢券复用 cmcc_wed：要带 --seckill 并把活动开抢时间作为 --at（服务器时间）传下去。
+        self.assertEqual(task_args("seckill", Path("a.json"), {}, False,
+                                   {"module": "cmcc_wed", "time": "08:00:00", "lead": 1,
+                                    "interval": 0.35, "max_attempts": 120}),
+                         ["--config", "a.json", "--seckill", "--at", "08:00:00",
+                          "--lead", "1", "--interval", "0.35", "--max-attempts", "120"])
+        self.assertNotIn("--at", task_args("seckill", Path("a.json"), {}, False,
+                                           {"lead": 5}), "假期秒杀的场次由服务端决定，不传 --at")
 
     def test_cache_keys_distinguish_same_phone_suffix(self):
         self.assertNotEqual(account_key("13800001234"), account_key("13900001234"))

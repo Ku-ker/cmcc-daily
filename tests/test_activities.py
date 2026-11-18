@@ -29,7 +29,15 @@ class ActivityRegistryTests(unittest.TestCase):
                 self.assertEqual(item["kind"], "seckill", "kind 同时是执行记录里的任务名")
                 self.assertTrue(item["name"].strip())
                 self.assertTrue(item["description"].strip())
-                self.assertEqual(set(item["defaults"]), set(SECKILL_DEFAULTS))
+                self.assertIn(item.get("module", "cmcc_seckill"), {"cmcc_seckill", "cmcc_wed"},
+                              "module 必须是 worker MODULES 白名单里的脚本")
+                self.assertLessEqual(set(item["defaults"]), set(SECKILL_DEFAULTS) | {"weekdays"})
+
+    def test_wed_activity_defaults_to_wednesday_only(self):
+        wed = next(item for item in ACTIVITIES if item["id"] == "wed-seckill")
+        self.assertEqual(wed["module"], "cmcc_wed", "周三抢券跑的是 cmcc_wed 的秒杀模式")
+        self.assertEqual(wed["defaults"]["time"], "08:00:00")
+        self.assertEqual(wed["defaults"]["weekdays"], [2], "场次只在周三，默认只排周三")
 
     def test_sync_adds_missing_activities_disabled(self):
         result = self.store.sync_activities(ACTIVITIES)
@@ -39,6 +47,9 @@ class ActivityRegistryTests(unittest.TestCase):
         self.assertEqual(activity["time"], definitions()[activity["id"]]["defaults"]["time"])
         self.assertEqual(activity["weekdays"], list(range(7)))
         self.assertEqual(activity["accounts"], [self.first["id"]])
+        wed = next(item for item in self.store.activities() if item["id"] == "wed-seckill")
+        self.assertEqual((wed["time"], wed["weekdays"]), ("08:00:00", [2]),
+                         "首次同步采用清单里的默认活动日")
         # 再同步一次不会重复插入
         again = self.store.sync_activities(ACTIVITIES)
         self.assertEqual((again["added"], again["updated"]), ([], [item["id"] for item in ACTIVITIES]))
@@ -82,6 +93,14 @@ class ActivityRegistryTests(unittest.TestCase):
         second = account("示例账号乙", "13700000022")
         self.store.save(second)
         self.assertEqual(self.store.activity_account_ids(), [self.first["id"], second["id"]])
+
+    def test_seckill_settings_carry_the_dispatch_module(self):
+        self.store.sync_activities(ACTIVITIES)
+        self.assertEqual(self.store.seckill_settings("wed-seckill")["module"], "cmcc_wed")
+        self.assertEqual(self.store.seckill_settings("seckill-daily")["module"], "cmcc_seckill")
+        self.assertEqual(self.store.seckill_settings("不存在")["module"], "cmcc_seckill",
+                         "未知活动退回假期秒杀脚本")
+        self.assertEqual(self.store.seckill_settings(None)["module"], "cmcc_seckill")
 
 
 class ActivitySettingsTests(unittest.TestCase):

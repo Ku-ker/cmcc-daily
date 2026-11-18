@@ -113,7 +113,7 @@ class PreviewTests(unittest.TestCase):
         """秒杀活动清单由后端预置：预览启动后自动出现，网页上不能新增。"""
         self.build()
         activities = self.store.activities()
-        self.assertEqual([item["id"] for item in activities], ["seckill-daily"])
+        self.assertEqual([item["id"] for item in activities], ["seckill-daily", "wed-seckill"])
         activity = activities[0]
         self.assertEqual({key: activity["config"][key] for key in ("lead", "interval", "max_attempts")},
                          {"lead": 5, "interval": 0.35, "max_attempts": 120})

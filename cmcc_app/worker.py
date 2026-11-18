@@ -24,6 +24,11 @@ def task_args(task, path, options, dry_run, settings=None):
         args.extend(f"--{flag}" for flag in ("tasks", "games", "wed") if options.get(flag))
     elif task == "seckill":
         # 上游秒杀脚本自带这几个开关，传入活动卡片的配置；缺失或非法时留给脚本用自己的默认值。
+        if (settings or {}).get("module") == "cmcc_wed":
+            # 周三充值日的场次由 --at 指定（服务器时间），假期秒杀的场次则由服务端接口决定。
+            args.append("--seckill")
+            if settings.get("time"):
+                args.extend(["--at", str(settings["time"])])
         for flag, key, convert in (("--lead", "lead", float), ("--interval", "interval", float),
                                    ("--max-attempts", "max_attempts", int)):
             try:
@@ -64,7 +69,11 @@ def main():
     results.start(task, json.loads(options_json), dry_run == "1" and task != "fee")
     code = 1
     try:
-        module = importlib.import_module(MODULES[task])
+        module_name = MODULES[task]
+        # 秒杀活动可在白名单内指定上游脚本（如周三抢券复用 cmcc_wed），防止导入任意模块。
+        if task == "seckill" and settings.get("module") in set(MODULES.values()):
+            module_name = settings["module"]
+        module = importlib.import_module(module_name)
         sys.argv = [module.__file__,
                     *task_args(task, config_path, json.loads(options_json), dry_run == "1", settings)]
         code = module.main()

@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from .activities import definitions
+
 SECRET_FIELDS = ("app_token", "fee_session_cookie", "serverchan_sendkey", "bark_url", "webhook_url", "webhook_token")
 CONFIG_DEFAULTS = {
     "app_token": "", "phone": "", "province_code": "731", "city_code": "0731",
@@ -840,7 +842,7 @@ class Store:
                 {"kind": item["kind"], "name": item["name"],
                  "config": {**defaults, **(old["config"] if old else {})},
                  "time": (old or {}).get("time") or defaults["time"],
-                 "weekdays": (old or {}).get("weekdays"),
+                 "weekdays": (old or {}).get("weekdays") or defaults.get("weekdays"),
                  "enabled": bool(old["enabled"]) if old else False},
                 {"id": item["id"]}, accounts=accounts, timezone_name=timezone_name)
             self.save_activity(activity, timezone_name)
@@ -916,16 +918,21 @@ class Store:
         return queued
 
     def seckill_settings(self, activity_id=None):
-        """这条秒杀记录要用的抢购参数：优先它所属的活动，其次第一个已启用的活动，最后用默认值。"""
+        """这条秒杀记录要用的抢购参数：优先它所属的活动，其次第一个已启用的活动，最后用默认值。
+
+        `module` 告诉 worker 该跑哪个上游脚本（假期秒杀和周三抢券的接口不同）。
+        """
         activities = self.activities()
         activity = (next((item for item in activities if item["id"] == activity_id), None)
                     or next((item for item in activities if item["enabled"]), None))
         config = activity["config"] if activity else SECKILL_DEFAULTS
+        defn = definitions().get(activity["id"]) if activity else None
         return {"name": activity["name"] if activity else "默认参数",
                 "time": activity["time"] if activity else SECKILL_DEFAULTS["time"],
                 "lead": config.get("lead", SECKILL_DEFAULTS["lead"]),
                 "interval": config.get("interval", SECKILL_DEFAULTS["interval"]),
-                "max_attempts": config.get("max_attempts", SECKILL_DEFAULTS["max_attempts"])}
+                "max_attempts": config.get("max_attempts", SECKILL_DEFAULTS["max_attempts"]),
+                "module": (defn or {}).get("module", "cmcc_seckill")}
 
     def activity_account_ids(self):
         """秒杀活动固定「全部账号参与」：按当前账号列表算，新增账号不用改配置。"""

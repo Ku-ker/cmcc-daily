@@ -63,8 +63,22 @@ class RunnerTests(unittest.TestCase):
         command = seen["command"]
         self.assertEqual(command[3], "seckill")
         self.assertEqual(json.loads(command[-1]), {"name": "示例抢券", "time": "11:59:55", "lead": 3,
-                                                   "interval": 0.5, "max_attempts": 40})
+                                                   "interval": 0.5, "max_attempts": 40,
+                                                   "module": "cmcc_seckill"})
         self.assertEqual(self.store.run(run_id)["status"], "success")
+        # 周三抢券活动的设置同样要到达 worker，且带着分发用的 module 字段。
+        wed = normalize_activity({"name": "周三抢券", "kind": "seckill", "time": "08:00:00",
+                                  "lead": 1, "interval": 0.35, "max_attempts": 120,
+                                  "weekdays": [2], "accounts": [], "enabled": True},
+                                 accounts=[self.account], timezone_name="Asia/Shanghai")
+        wed["id"] = "wed-seckill"
+        self.store.save_activity(wed)
+        seen.clear()
+        wed_run_id = self.store.enqueue(self.account["id"], "seckill", activity_id="wed-seckill")
+        with patch("cmcc_app.runner.subprocess.Popen", side_effect=fake_worker):
+            self.manager.execute(self.store.take_run_parallel())
+        self.assertEqual(json.loads(seen["command"][-1])["module"], "cmcc_wed")
+        self.assertEqual(self.store.run(wed_run_id)["status"], "success")
         # 其他任务不追加这个参数，避免上游脚本收到无法识别的开关。
         seen.clear()
         self.store.enqueue(self.account["id"], "sign")

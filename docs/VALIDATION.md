@@ -1,5 +1,15 @@
 # 验证记录
 
+## 1.7.1：周三充值日 8 点抢券网页活动（2026-11-18，未发布）
+
+「周三充值日」场次抢券（`cmcc_wed.py --seckill`，`drawPrize` 接口）接入「秒杀任务」页：`cmcc_app/activities.py` 新增预置活动 `wed-seckill`（kind 仍为 `seckill`，默认 08:00:00、活动日仅周三、提前量 1 秒），活动定义新增可选 `module` 字段分发上游脚本——`Store.seckill_settings` 把 module 并入第 5 参数 JSON，`worker.py` 经 `MODULES` 白名单校验后导入对应脚本，并在 `cmcc_wed` 分支补传 `--seckill` 与 `--at`（假期秒杀场次由服务端接口决定，不传 `--at`，这是两脚本的关键差异）。`sync_activities` 支持清单默认活动日（`defaults.weekdays`），且不覆盖用户已保存的设置；前端零改动，活动卡片、配置弹窗、立即执行与记录链路全部按既有通用逻辑渲染。README 同步移除「秒杀脚本保留为命令行功能」的旧说明。
+
+验证：Python 3.12 下 `python -m unittest discover -s tests` 共 222 项通过（4 项 Linux 专用测试在 Windows 跳过）。新增覆盖：清单条目 `module` 白名单与 `defaults.weekdays` 形态、wed 活动默认时间/活动日同步、`seckill_settings` 对 wed/未知/无活动 id 的 module 回退、`task_args` 周三分支拼出 `--seckill --at`（假期秒杀不传 `--at`）、runner 层 wed 活动 settings JSON 带出 `module: cmcc_wed`、预览活动清单含两个活动。
+
+预览实例（Windows，`CMCC_PREVIEW=1` 隔离临时目录，端口 8765）：`/api/activities` 返回两张活动卡片，wed-seckill 默认值正确且 `next_run` 算到下一个周三；PUT 修改开抢时间/提前量/间隔/次数后重新拉取保留，seckill-daily 配置不受同步影响；对 wed-seckill「立即执行」入队 6 条记录且 `activity_id=wed-seckill`，预览模拟全部成功，删除临时数据目录。
+
+未完成：本环境无浏览器工具，活动卡片与配置弹窗的实际渲染未做页面级检查（弹窗逻辑 `openActivity` 按后端字段通用渲染，API 数据形态已验证）；真实抢购依赖周三场次与真实账号凭证，未验证；镜像未构建、未发布，代码提交待用户确认。
+
 ## 1.7.0：上游 fix #16/#18 合入与应用内凭证保活（2026-11-13，未发布）
 
 改动来源：上游 yupaiLy/cmcc-auto-checkin 两个未合并 fix。#16：2026-10-20 起服务端拒绝「只带 jwt」的续期，`cmcc_sign.exchange_session` 改为三档（jwt+app_token → jwt 单独 → 纯 app_token 引导）。#18：上游偶发返回裸 JSON 字符串（如 `"系统繁忙"`）导致 `AttributeError`，新增 `json_obj()` 守卫应用到 appTokenLogin／markstatus／domark／taskAward 四处；另移植 `cmcc_keepalive.py`（独立保活脚本）与 `cmcc_app_token_probe.py`（app_token 存活探针）。本仓库增强：保活集成为应用内后台任务——账号表新增 5 列（启用/间隔/状态/时间/详情），编辑页开关 + 间隔分钟（5–720），Manager 每 30 秒扫描到期账号起守护线程执行；仅状态转为 failed 时推送一次通知，恢复后再次失败才重新推送；保活不写入执行记录；运行配置用完即删。探针仅作独立脚本，不接 UI。
